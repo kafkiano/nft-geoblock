@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# nft-geoblock.sh -- load country IP blocks into an nftables verdict map.
+# nft-geoblock.sh -- load country IP blocks into an nftables set.
 #
 # usage: nft-geoblock.sh [-n name] [-p ports] [-w] CC [CC ...]
 #
-#   -n name   table and map name (default: geoip)
+#   -n name   table and set name (default: geoip)
 #   -p ports  comma-separated ports/ranges, e.g. "80,443" or "1000-2000"
 #   -w        whitelist mode (default: blacklist)
 #   CC        two-letter country codes, e.g. DE ES FR
@@ -27,7 +27,7 @@ usage() {
     cat >&2 <<EOF
 usage: $PROG [-n name] [-p ports] [-w] CC [CC ...]
 
-  -n name   table and map name (default: geoip)
+  -n name   table and set name (default: geoip)
   -p ports  comma-separated ports/ranges, e.g. "80,443" or "1000-2000"
   -w        whitelist mode (default: blacklist)
   CC        two-letter country codes, e.g. DE ES FR
@@ -94,7 +94,7 @@ else
     SSH_EXCEPTION="tcp dport 22 accept"
 fi
 
-# In whitelist mode map elements carry :accept, otherwise :drop.
+# Verdict applied by the rule that references the set.
 if [[ $WHITELIST -eq 1 ]]; then
     VERDICT=accept
 else
@@ -103,10 +103,10 @@ fi
 
 {
     echo "add table $FAMILY $NAME"
-    echo "add map   $FAMILY $NAME $NAME { type ipv4_addr : verdict; flags interval; }"
+    echo "add set   $FAMILY $NAME $NAME { type ipv4_addr; flags interval; }"
     echo "add chain $FAMILY $NAME input { type filter hook $HOOK priority $PRIORITY; policy accept; }"
     echo "flush chain $FAMILY $NAME input"
-    echo "flush map $FAMILY $NAME $NAME"
+    echo "flush set   $FAMILY $NAME $NAME"
 
     for cc in "$@"; do
         cc=${cc^^}
@@ -115,8 +115,8 @@ fi
             continue
         fi
         curl -fsSL "https://www.ipdeny.com/ipblocks/data/countries/${cc,,}.zone" \
-            | awk -v f="$FAMILY" -v t="$NAME" -v m="$NAME" -v v="$VERDICT" \
-              '/^[0-9]/{print "add element " f " " t " " m " { " $1 " : " v " }"}' \
+            | awk -v f="$FAMILY" -v t="$NAME" -v s="$NAME" \
+              '/^[0-9]/{print "add element " f " " t " " s " { " $1 " }"}' \
             || echo "$PROG: download failed: $cc" >&2
     done
 
@@ -124,15 +124,15 @@ fi
         echo "add rule $FAMILY $NAME input $SSH_EXCEPTION"
     fi
 
-    # vmap applies the verdict stored in the map; in whitelist mode a
-    # trailing drop catches non-matching sources on the matched ports.
-    echo "add rule $FAMILY $NAME input ${PORT_MATCH}ip saddr vmap @$NAME"
+    # Set lookup; the verdict is now part of the rule, not the element.
+    # In whitelist mode a trailing drop catches non-matching sources.
+    echo "add rule $FAMILY $NAME input ${PORT_MATCH}ip saddr @$NAME $VERDICT"
     if [[ $WHITELIST -eq 1 ]]; then
         echo "add rule $FAMILY $NAME input ${PORT_MATCH}drop"
     fi
 } > "$TMP_RULES"
 
-MIN_LINES=4
+MIN_LINES=5
 if [[ -n $SSH_EXCEPTION ]]; then
     MIN_LINES=$((MIN_LINES + 1))
 fi
@@ -148,5 +148,5 @@ fi
 
 nft -f "$TMP_RULES"
 
-n=$(nft list map "$FAMILY" "$NAME" "$NAME" 2>/dev/null | grep -c '^[[:space:]]*[0-9]' || true)
+n=$(nft list set "$FAMILY" "$NAME" "$NAME" 2>/dev/null | grep -c '^[[:space:]]*[0-9]' || true)
 echo "$NAME: $n entries"
