@@ -148,5 +148,6 @@ fi
 
 nft -f "$TMP_RULES"
 
-n=$(nft list set "$FAMILY" "$NAME" "$NAME" 2>/dev/null | grep -c '^[[:space:]]*[0-9]' || true)
+n=$(nft list set "$FAMILY" "$NAME" "$NAME" 2>/dev/null \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | wc -l)
 echo "$NAME: $n entries"
