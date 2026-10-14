@@ -2,17 +2,20 @@
 #
 # nft-geoblock.sh -- load country IP blocks into an nftables set.
 #
-# usage: nft-geoblock.sh [-n name] [-p ports] [-w] [-d] CC [CC ...]
+# usage: nft-geoblock.sh [-n name] [-p ports] [-w] [-s] [-d] CC [CC ...]
 #
 #   -n name   table and set name (default: geoip)
 #   -p ports  comma-separated ports/ranges, e.g. "80,443" or "1000-2000"
 #   -w        whitelist mode (default: blacklist)
+#   -s        unsafe: allow SSH (22) to be filtered
 #   -d        dry-run: print ruleset to stdout, do not apply
 #   CC        two-letter country codes, e.g. DE ES FR
 #
-# Port 22 (SSH) must not appear in -p. In blacklist mode without -p, SSH
-# is auto-exempted (lockout protection). In whitelist mode without -p,
-# SSH is reachable only from the listed countries.
+# Port 22 (SSH) is protected by default:
+#   with -p:     port 22 is rejected in the port list
+#   without -p:  an SSH exemption (tcp dport 22 accept) is added
+# The -s flag disables both protections, so SSH can be filtered like
+# any other port (with -p) or be subject to the geoblock rule (without -p).
 
 set -euo pipefail
 
@@ -22,34 +25,36 @@ FAMILY=inet
 HOOK=input
 PRIORITY=mangle
 WHITELIST=0
+SSH_PROTECTED=1
 DRY_RUN=0
 PORTS=""
 TMP_RULES=$(mktemp)
 
 usage() {
     cat >&2 <<EOF
-usage: $PROG [-n name] [-p ports] [-w] [-d] CC [CC ...]
+usage: $PROG [-n name] [-p ports] [-w] [-s] [-d] CC [CC ...]
 
   -n name   table and set name (default: geoip)
   -p ports  comma-separated ports/ranges, e.g. "80,443" or "1000-2000"
   -w        whitelist mode (default: blacklist)
+  -s        unsafe: allow SSH (22) to be filtered
   -d        dry-run: print ruleset to stdout, do not apply
   CC        two-letter country codes, e.g. DE ES FR
 
-Port 22 (SSH) must not appear in -p. In blacklist mode without -p, SSH
-is auto-exempted. In whitelist mode without -p, SSH is reachable only
-from the listed countries.
+Port 22 (SSH) is protected by default: with -p it is rejected in the
+port list, without -p an SSH exemption is added. -s disables both.
 EOF
     exit 2
 }
 
 die() { echo "$PROG: $*" >&2; exit 1; }
 
-while getopts 'n:p:wdh' opt; do
+while getopts 'n:p:wsdh' opt; do
     case $opt in
         n) NAME=$OPTARG ;;
         p) PORTS=$OPTARG ;;
         w) WHITELIST=1 ;;
+        s) SSH_PROTECTED=0 ;;
         d) DRY_RUN=1 ;;
         h) usage ;;
         ?) usage ;;
@@ -64,7 +69,8 @@ command -v curl >/dev/null || die "curl not installed"
 
 trap 'rm -f "$TMP_RULES"' EXIT
 
-# Reject port 22 anywhere in the list (also inside ranges like 20-30).
+# Reject port 22 anywhere in the list (also inside ranges like 20-30)
+# unless -s was given.
 validate_ports() {
     local ports="$1" p lo hi
     local IFS=','
@@ -75,15 +81,15 @@ validate_ports() {
             if (( lo < 1 || hi > 65535 || lo > hi )); then
                 die "invalid port range: $p"
             fi
-            if (( lo <= 22 && 22 <= hi )); then
-                die "port 22 (SSH) in range '$p' must not be filtered"
+            if (( SSH_PROTECTED )) && (( lo <= 22 && 22 <= hi )); then
+                die "port 22 (SSH) in range '$p' must not be filtered (use -s to override)"
             fi
         elif [[ $p =~ ^[0-9]+$ ]]; then
             if (( p < 1 || p > 65535 )); then
                 die "invalid port: $p"
             fi
-            if (( p == 22 )); then
-                die "port 22 (SSH) must not be filtered"
+            if (( SSH_PROTECTED )) && (( p == 22 )); then
+                die "port 22 (SSH) must not be filtered (use -s to override)"
             fi
         else
             die "invalid port spec: $p"
@@ -92,21 +98,16 @@ validate_ports() {
 }
 
 # Build port match and (optional) SSH exemption.
-#
-#   -p given:                filter exactly those ports; 22 is rejected.
-#   blacklist without -p:    filter everything except SSH; SSH exempt.
-#   whitelist without -p:    filter everything; SSH subject to whitelist
-#                            (warn, since this changes SSH reachability).
-SSH_EXCEPTION=""
 if [[ -n $PORTS ]]; then
     validate_ports "$PORTS"
     PORT_MATCH="tcp dport { $PORTS } "
+    SSH_EXCEPTION=""
 else
     PORT_MATCH=""
-    if [[ $WHITELIST -eq 1 ]]; then
-        echo "$PROG: warning: whitelist mode without -p: SSH (22) will only be reachable from listed countries" >&2
-    else
+    if (( SSH_PROTECTED )); then
         SSH_EXCEPTION="tcp dport 22 accept"
+    else
+        SSH_EXCEPTION=""
     fi
 fi
 
