@@ -2,15 +2,17 @@
 #
 # nft-geoblock.sh -- load country IP blocks into an nftables set.
 #
-# usage: nft-geoblock.sh [-n name] [-p ports] [-w] CC [CC ...]
+# usage: nft-geoblock.sh [-n name] [-p ports] [-w] [-d] CC [CC ...]
 #
 #   -n name   table and set name (default: geoip)
 #   -p ports  comma-separated ports/ranges, e.g. "80,443" or "1000-2000"
 #   -w        whitelist mode (default: blacklist)
+#   -d        dry-run: print ruleset to stdout, do not apply
 #   CC        two-letter country codes, e.g. DE ES FR
 #
-# Port 22 (SSH) can never be filtered: without -p it is auto-exempted,
-# with -p any occurrence of 22 aborts the script.
+# Port 22 (SSH) must not appear in -p. In blacklist mode without -p, SSH
+# is auto-exempted (lockout protection). In whitelist mode without -p,
+# SSH is reachable only from the listed countries.
 
 set -euo pipefail
 
@@ -20,30 +22,35 @@ FAMILY=inet
 HOOK=input
 PRIORITY=mangle
 WHITELIST=0
+DRY_RUN=0
 PORTS=""
 TMP_RULES=$(mktemp)
 
 usage() {
     cat >&2 <<EOF
-usage: $PROG [-n name] [-p ports] [-w] CC [CC ...]
+usage: $PROG [-n name] [-p ports] [-w] [-d] CC [CC ...]
 
   -n name   table and set name (default: geoip)
   -p ports  comma-separated ports/ranges, e.g. "80,443" or "1000-2000"
   -w        whitelist mode (default: blacklist)
+  -d        dry-run: print ruleset to stdout, do not apply
   CC        two-letter country codes, e.g. DE ES FR
 
-Port 22 (SSH) is never filtered.
+Port 22 (SSH) must not appear in -p. In blacklist mode without -p, SSH
+is auto-exempted. In whitelist mode without -p, SSH is reachable only
+from the listed countries.
 EOF
     exit 2
 }
 
 die() { echo "$PROG: $*" >&2; exit 1; }
 
-while getopts 'n:p:wh' opt; do
+while getopts 'n:p:wdh' opt; do
     case $opt in
         n) NAME=$OPTARG ;;
         p) PORTS=$OPTARG ;;
         w) WHITELIST=1 ;;
+        d) DRY_RUN=1 ;;
         h) usage ;;
         ?) usage ;;
     esac
@@ -85,13 +92,22 @@ validate_ports() {
 }
 
 # Build port match and (optional) SSH exemption.
+#
+#   -p given:                filter exactly those ports; 22 is rejected.
+#   blacklist without -p:    filter everything except SSH; SSH exempt.
+#   whitelist without -p:    filter everything; SSH subject to whitelist
+#                            (warn, since this changes SSH reachability).
+SSH_EXCEPTION=""
 if [[ -n $PORTS ]]; then
     validate_ports "$PORTS"
     PORT_MATCH="tcp dport { $PORTS } "
-    SSH_EXCEPTION=""
 else
     PORT_MATCH=""
-    SSH_EXCEPTION="tcp dport 22 accept"
+    if [[ $WHITELIST -eq 1 ]]; then
+        echo "$PROG: warning: whitelist mode without -p: SSH (22) will only be reachable from listed countries" >&2
+    else
+        SSH_EXCEPTION="tcp dport 22 accept"
+    fi
 fi
 
 # Verdict applied by the rule that references the set.
@@ -114,36 +130,35 @@ fi
             echo "$PROG: invalid CC: $cc" >&2
             continue
         fi
-        curl -fsSL "https://www.ipdeny.com/ipblocks/data/countries/${cc,,}.zone" \
+        if ! curl -fsSL "https://www.ipdeny.com/ipblocks/data/countries/${cc,,}.zone" \
             | awk -v f="$FAMILY" -v t="$NAME" -v s="$NAME" \
-              '/^[0-9]/{print "add element " f " " t " " s " { " $1 " }"}' \
-            || echo "$PROG: download failed: $cc" >&2
+              '/^[0-9]/{print "add element " f " " t " " s " { " $1 " }"}'; then
+            echo "$PROG: download failed: $cc" >&2
+        fi
     done
 
     if [[ -n $SSH_EXCEPTION ]]; then
         echo "add rule $FAMILY $NAME input $SSH_EXCEPTION"
     fi
 
-    # Set lookup; the verdict is now part of the rule, not the element.
+    # Set lookup; the verdict is part of the rule, not the element.
+    # ct state new ensures established flows (including replies to
+    # locally initiated sessions) are not disturbed by the drop.
     # In whitelist mode a trailing drop catches non-matching sources.
-    echo "add rule $FAMILY $NAME input ${PORT_MATCH}ip saddr @$NAME $VERDICT"
+    echo "add rule $FAMILY $NAME input ${PORT_MATCH}ip saddr @$NAME ct state new $VERDICT"
     if [[ $WHITELIST -eq 1 ]]; then
-        echo "add rule $FAMILY $NAME input ${PORT_MATCH}drop"
+        echo "add rule $FAMILY $NAME input ${PORT_MATCH}ct state new drop"
     fi
 } > "$TMP_RULES"
 
-MIN_LINES=5
-if [[ -n $SSH_EXCEPTION ]]; then
-    MIN_LINES=$((MIN_LINES + 1))
-fi
-if [[ $WHITELIST -eq 1 ]]; then
-    MIN_LINES=$((MIN_LINES + 2))
-else
-    MIN_LINES=$((MIN_LINES + 1))
+entries=$(awk '/^add element /{n++} END{print n+0}' "$TMP_RULES")
+if (( entries == 0 )); then
+    die "no entries collected"
 fi
 
-if [[ $(wc -l < "$TMP_RULES") -le $MIN_LINES ]]; then
-    die "no entries collected"
+if (( DRY_RUN )); then
+    cat "$TMP_RULES"
+    exit 0
 fi
 
 nft -f "$TMP_RULES"
