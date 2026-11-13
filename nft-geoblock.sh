@@ -2,13 +2,12 @@
 #
 # nft-geoblock.sh -- load country IP blocks into an nftables set.
 #
-# usage: nft-geoblock.sh [-n name] [-p ports] [-w] [-s] [-d] CC [CC ...]
+# usage: nft-geoblock.sh [-n name] [-p ports] [-w] [-s] CC [CC ...]
 #
 #   -n name   table and set name (default: geoip)
 #   -p ports  comma-separated ports/ranges, e.g. "80,443" or "1000-2000"
 #   -w        whitelist mode (default: blacklist)
 #   -s        unsafe: allow SSH (22) to be filtered
-#   -d        dry-run: print ruleset to stdout, do not apply
 #   CC        two-letter country codes, e.g. DE ES FR
 #
 # Port 22 (SSH) is protected by default:
@@ -32,19 +31,17 @@ HOOK=input
 PRIORITY=mangle
 WHITELIST=0
 SSH_PROTECTED=1
-DRY_RUN=0
 PORTS=""
 TMP_RULES=$(mktemp)
 
 usage() {
     cat >&2 <<EOF
-usage: $PROG [-n name] [-p ports] [-w] [-s] [-d] CC [CC ...]
+usage: $PROG [-n name] [-p ports] [-w] [-s] CC [CC ...]
 
   -n name   table and set name (default: geoip)
   -p ports  comma-separated ports/ranges, e.g. "80,443" or "1000-2000"
   -w        whitelist mode (default: blacklist)
   -s        unsafe: allow SSH (22) to be filtered
-  -d        dry-run: print ruleset to stdout, do not apply
   CC        two-letter country codes, e.g. DE ES FR
 
 Port 22 (SSH) is protected by default: with -p it is rejected in the
@@ -58,13 +55,12 @@ EOF
 
 die() { echo "$PROG: $*" >&2; exit 1; }
 
-while getopts 'n:p:wsdh' opt; do
+while getopts 'n:p:wsh' opt; do
     case $opt in
         n) NAME=$OPTARG ;;
         p) PORTS=$OPTARG ;;
         w) WHITELIST=1 ;;
         s) SSH_PROTECTED=0 ;;
-        d) DRY_RUN=1 ;;
         h) usage ;;
         ?) usage ;;
     esac
@@ -130,12 +126,28 @@ port_80_affected() {
     port_spec_has_80 "$PORTS"
 }
 
+# True if both renewal hooks exist and reference the current table.
+certbot_hooks_up_to_date() {
+    local dir=/etc/letsencrypt/renewal-hooks
+    local pre="$dir/pre/01-open-port-80"
+    local post="$dir/post/01-close-port-80"
+    [[ -f $pre && -f $post ]] \
+        && grep -qF "list chain $FAMILY $NAME input" "$pre" \
+        && grep -qF "list chain $FAMILY $NAME input" "$post"
+}
+
 # Write certbot renewal hooks that temporarily accept port 80 during
-# HTTP-01 challenges. Idempotent: rewrites the two hook files each time.
+# HTTP-01 challenges. Writes the hooks only if they are missing or
+# reference a different table/set.
 install_certbot_hooks() {
     local dir=/etc/letsencrypt/renewal-hooks
     local pre="$dir/pre/01-open-port-80"
     local post="$dir/post/01-close-port-80"
+
+    if certbot_hooks_up_to_date; then
+        echo "$PROG: certbot renewal hooks already present, skipping" >&2
+        return 0
+    fi
 
     mkdir -p "$dir/pre" "$dir/post"
 
@@ -234,19 +246,6 @@ fi
 entries=$(awk '/^add element /{n++} END{print n+0}' "$TMP_RULES")
 if (( entries == 0 )); then
     die "no entries collected"
-fi
-
-if (( DRY_RUN )); then
-    cat "$TMP_RULES"
-    if port_80_affected; then
-        if command -v certbot >/dev/null 2>&1 || [ -d /etc/letsencrypt ]; then
-            echo "$PROG: would install certbot renewal hooks for port 80" >&2
-        else
-            echo "$PROG: note: port 80 is affected but certbot was not" \
-                 "detected; no hooks would be installed" >&2
-        fi
-    fi
-    exit 0
 fi
 
 nft -f "$TMP_RULES"
